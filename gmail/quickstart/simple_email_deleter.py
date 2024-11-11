@@ -16,107 +16,64 @@ from googleapiclient.errors import HttpError
 
 # Define the Gmail API scope
 SCOPES = ["https://mail.google.com/"]
-
-# Base paths and files
-BASE_PATH = "/Users/vikrantbhosale/Documents/backups/gmail"  # Adjust this path as needed
-MONTH_LOG_FILE = os.path.join(BASE_PATH, "email_month_progress.log")  # Log for processed months
-CHUNK_LOG_FILE = os.path.join(BASE_PATH, "email_chunk_progress.log")  # Log for processed chunks
-SAVE_PATH = os.path.join(BASE_PATH, "emails")
+BASE_PATH = "/Users/vikrantbhosale/Documents/backups/gmail"
+LOG_FILE = f"{BASE_PATH}/email_progress.log"
+SAVE_PATH = f"{BASE_PATH}/emails"
 
 # Rate limiting constants
-MAX_WORKERS = 20        # Maximum number of worker threads
-MAX_RETRIES = 5         # Maximum number of retries for rate limit errors
-
-# Constants for dynamic adjustment
-DAY_CHUNK_SIZE = 5      # Initial number of days per chunk (configurable)
-MIN_DAY_CHUNK_SIZE = 1
-MIN_MAX_WORKERS = 5
-RATE_LIMIT_THRESHOLD = 5
-COOLDOWN_PERIOD = 300   # Cooldown period in seconds (e.g., 5 minutes)
-MAX_DAY_CHUNK_SIZE = 30
-MAX_MAX_WORKERS = 20
-
-# Global variables for rate limit tracking
-rate_limit_errors = 0
-last_rate_limit_time = None
+MAX_WORKERS = 200  # Adjust based on Gmail API limits
+MAX_RETRIES = 5   # Maximum number of retries for rate limit errors
 
 def authenticate_gmail():
-    """
-    Authenticates the user and returns the Gmail credentials.
-    """
+    """Authenticates the user and returns the Gmail service."""
     creds = None
-    # Delete token.json to ensure fresh authentication
+    # Delete the token.json file to ensure fresh authentication
     if os.path.exists("token.json"):
         os.remove("token.json")
-    # Check if token.json exists
+    # The file token.json stores the user's access and refresh tokens.
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    # If there are no valid credentials, initiate the login flow
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # Run the OAuth flow to get new credentials
+            # Initiate the OAuth flow to get new credentials with the required scopes
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
         # Save the credentials for future runs
         with open("token.json", "w") as token:
             token.write(creds.to_json())
-    return creds
+    return creds  # Return credentials instead of service
 
 def build_service(creds):
-    """
-    Builds a new Gmail service instance.
-    """
+    """Builds a new Gmail service instance."""
     return build("gmail", "v1", credentials=creds)
 
-def log_month_progress(year, month):
-    """
-    Logs the processed month to the month log file.
-    """
-    with open(MONTH_LOG_FILE, "a") as log_file:
+def log_progress(year, month):
+    """Logs the current download progress to the log file."""
+    with open(LOG_FILE, "a") as log_file:
         log_file.write(f"{year}/{month}\n")
 
 def load_processed_months():
-    """
-    Loads the processed months from the month log file into a set.
-    """
+    """Loads the processed months from the log file into a set."""
     processed_months = set()
-    if os.path.exists(MONTH_LOG_FILE):
-        with open(MONTH_LOG_FILE, "r") as log_file:
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as log_file:
             entries = log_file.read().splitlines()
             processed_months.update(entries)
     return processed_months
 
-def log_chunk_progress(year, month, chunk_start_day, chunk_end_day):
-    """
-    Logs the processed chunk to the chunk log file.
-    """
-    with open(CHUNK_LOG_FILE, "a") as log_file:
-        log_file.write(f"{year}/{month}/{chunk_start_day}-{chunk_end_day}\n")
-
-def load_processed_chunks():
-    """
-    Loads the processed chunks from the chunk log file into a set.
-    """
-    processed_chunks = set()
-    if os.path.exists(CHUNK_LOG_FILE):
-        with open(CHUNK_LOG_FILE, "r") as log_file:
-            entries = log_file.read().splitlines()
-            processed_chunks.update(entries)
-    return processed_chunks
-
 def sanitize_filename(filename, max_length=100):
-    """
-    Sanitizes a string to be used as a safe filename.
-    """
+    """Sanitizes a string to be used as a safe filename."""
     sanitized = ''.join(c for c in filename if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
     return sanitized[:max_length]
 
+def get_zip_file_path(year, month):
+    """Returns the path of the zip file for the specified year and month."""
+    return os.path.join(SAVE_PATH, str(year), f"{month:02d}.zip")
+
 def prepare_email_data(email_message, msg_id):
-    """
-    Extracts and structures email data for buffering.
-    """
+    """Extracts and structures email data for buffering."""
     # Extract email components
     sender = email_message.get('From', 'unknown_sender')
     subject = email_message.get('Subject', 'no_subject')
@@ -179,9 +136,7 @@ def prepare_email_data(email_message, msg_id):
     return email_data
 
 def extract_attachment(part):
-    """
-    Extracts attachment data from a part.
-    """
+    """Extracts attachment data from a part."""
     filename = part.get_filename()
     if filename:
         filename = email.utils.collapse_rfc2231_value(filename)
@@ -196,9 +151,7 @@ def extract_attachment(part):
     return None
 
 def write_buffer_to_disk(email_buffer, folder_path):
-    """
-    Writes buffered emails to disk.
-    """
+    """Writes buffered emails to disk."""
     for email_data in email_buffer:
         email_folder_path = os.path.join(folder_path, email_data['folder_name'])
         os.makedirs(email_folder_path, exist_ok=True)
@@ -232,47 +185,13 @@ def write_buffer_to_disk(email_buffer, folder_path):
                 f.write(attachment['data'])
             print(f"Saved attachment: {file_path}")
 
-def adjust_parallelization():
-    """
-    Adjusts the parallelization parameters when rate limiting occurs.
-    """
-    global rate_limit_errors, MAX_WORKERS, DAY_CHUNK_SIZE, last_rate_limit_time
-    if rate_limit_errors >= RATE_LIMIT_THRESHOLD:
-        if MAX_WORKERS > MIN_MAX_WORKERS:
-            MAX_WORKERS = max(MIN_MAX_WORKERS, MAX_WORKERS // 2)
-            print(f"Reduced MAX_WORKERS to {MAX_WORKERS} due to rate limiting.")
-        if DAY_CHUNK_SIZE > MIN_DAY_CHUNK_SIZE:
-            DAY_CHUNK_SIZE = max(MIN_DAY_CHUNK_SIZE, DAY_CHUNK_SIZE // 2)
-            print(f"Reduced DAY_CHUNK_SIZE to {DAY_CHUNK_SIZE} due to rate limiting.")
-        rate_limit_errors = 0
-        last_rate_limit_time = time.time()
-
-def increase_parallelization():
-    """
-    Increases the parallelization parameters after a cooldown period without rate limiting.
-    """
-    global MAX_WORKERS, DAY_CHUNK_SIZE, last_rate_limit_time
-    if last_rate_limit_time:
-        elapsed_time = time.time() - last_rate_limit_time
-        if elapsed_time > COOLDOWN_PERIOD:
-            if MAX_WORKERS < MAX_MAX_WORKERS:
-                MAX_WORKERS = min(MAX_MAX_WORKERS, MAX_WORKERS * 2)
-                print(f"Increased MAX_WORKERS to {MAX_WORKERS}.")
-            if DAY_CHUNK_SIZE < MAX_DAY_CHUNK_SIZE:
-                DAY_CHUNK_SIZE = min(MAX_DAY_CHUNK_SIZE, DAY_CHUNK_SIZE * 2)
-                print(f"Increased DAY_CHUNK_SIZE to {DAY_CHUNK_SIZE}.")
-            last_rate_limit_time = None
-
 def process_email(creds, msg_id):
-    """
-    Processes a single email message and returns the data.
-    """
-    global rate_limit_errors
-    service = build_service(creds)
+    """Processes a single email message and returns the data."""
+    service = build_service(creds)  # Build a new service instance per thread
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            # Fetch the email message
+            # Fetch the email
             message = service.users().messages().get(
                 userId="me",
                 id=msg_id,
@@ -288,125 +207,25 @@ def process_email(creds, msg_id):
         except HttpError as error:
             if error.resp.status == 429:  # Rate limit error
                 retry_count += 1
-                rate_limit_errors += 1
-                adjust_parallelization()
                 sleep_time = 2 ** retry_count
-                print(f"Rate limit reached for email ID {msg_id}, retrying after {sleep_time} seconds...")
+                print(f"Rate limit reached while processing email ID {msg_id}, retrying after {sleep_time} seconds...")
                 time.sleep(sleep_time)
             else:
-                print(f"Error downloading email ID {msg_id}: {error}")
+                print(f"An error occurred while downloading email ID {msg_id}: {error}")
                 return None
         except Exception as e:
             print(f"Failed to process email ID {msg_id}: {e}")
             return None
-    print(f"Exceeded retries for email ID {msg_id}. Skipping.")
+    print(f"Exceeded maximum retries for email ID {msg_id}. Skipping.")
     return None
 
-def fetch_and_process_chunk(creds, query, folder_path, processed_chunk):
-    """
-    Fetches and processes emails for a given query (chunk).
-    """
-    service = build_service(creds)
-    page_token = None
-    all_message_ids = []
-
-    while True:
-        try:
-            # Fetch emails with pagination
-            results = service.users().messages().list(
-                userId="me",
-                q=query,
-                pageToken=page_token,
-                maxResults=500  # Increase batch size
-            ).execute()
-            messages = results.get("messages", [])
-
-            if not messages:
-                if not page_token:
-                    print(f"No messages found for query: {query}")
-                break
-
-            # Collect message IDs
-            all_message_ids.extend([msg["id"] for msg in messages])
-
-            page_token = results.get("nextPageToken")
-            if not page_token:
-                break  # Exit the loop if there are no more pages
-
-        except HttpError as error:
-            print(f"Error fetching messages: {error}")
-            if error.resp.status == 429:
-                print("Rate limit reached, waiting before retrying...")
-                time.sleep(10)
-                continue
-
-    if all_message_ids:
-        # Process emails in parallel
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_email, creds, msg_id) for msg_id in all_message_ids]
-            email_buffer = []
-            buffer_limit = 100  # Adjust as needed
-
-            for future in as_completed(futures):
-                email_data = future.result()
-                if email_data:
-                    email_buffer.append(email_data)
-                    print(f"Processed email: {email_data['folder_name']}")
-                else:
-                    print("Failed to process an email.")
-
-                if len(email_buffer) >= buffer_limit:
-                    write_buffer_to_disk(email_buffer, folder_path)
-                    email_buffer.clear()
-
-            # Write any remaining emails in the buffer
-            if email_buffer:
-                write_buffer_to_disk(email_buffer, folder_path)
-                email_buffer.clear()
-
-        # Log the processed chunk
-        year, month, days = processed_chunk.split('/')
-        chunk_start_day, chunk_end_day = days.split('-')
-        log_chunk_progress(year, month, chunk_start_day, chunk_end_day)
-    else:
-        print(f"No emails found for query: {query}")
-        # Even if no emails are found, log the chunk to avoid reprocessing
-        year, month, days = processed_chunk.split('/')
-        chunk_start_day, chunk_end_day = days.split('-')
-        log_chunk_progress(year, month, chunk_start_day, chunk_end_day)
-
-def check_emails_in_month(service, year, month, after_date_str, before_date_str):
-    """
-    Checks if there are any emails in the specified month.
-    """
-    query = f"after:{after_date_str} before:{before_date_str} -in:spam -in:trash"
-    try:
-        results = service.users().messages().list(
-            userId="me",
-            q=query,
-            maxResults=1  # Only need to check if at least one email exists
-        ).execute()
-        messages = results.get("messages", [])
-        if messages:
-            return True
-        else:
-            return False
-    except HttpError as error:
-        print(f"Error checking emails for {year}/{month}: {error}")
-        return False
-
-def download_and_organize_emails(creds, cutoff_date_str, save_path="emails"):
-    """
-    Downloads emails before the specified cutoff date and organizes them by year and month.
-    """
-    global DAY_CHUNK_SIZE
-    service = build_service(creds)
+def download_and_organize_emails(creds, cutoff_date_str, save_path="emails", processed_months=None):
+    """Downloads emails before the specified cutoff date and organizes them by year and month."""
+    service = build_service(creds)  # Main service instance for listing emails
     cutoff_date = datetime.datetime.strptime(cutoff_date_str, "%m-%d-%Y")
-    processed_months = load_processed_months()
-    processed_chunks = load_processed_chunks()
     try:
         # Generate all months up to the cutoff date
-        start_date = datetime.datetime(2000, 1, 1)  # Adjust as needed
+        start_date = datetime.datetime(2015, 1, 1)  # Adjust as needed
         end_date = cutoff_date
         months = []
         current_date = start_date
@@ -416,9 +235,14 @@ def download_and_organize_emails(creds, cutoff_date_str, save_path="emails"):
             current_date = current_date.replace(day=1)
 
         for year, month in months:
-            month_key = f"{year}/{month}"
-            if month_key in processed_months:
-                print(f"Skipping {year}/{month} as it's already processed.")
+            if f"{year}/{month}" in processed_months:
+                print(f"Skipping {year}/{month} as it is already processed.")
+                continue
+            # if a file exists at location {BASE_PATH}/emails/{year}/{month}.zip then skip this month
+            zipfile_path = get_zip_file_path(year, month)
+            if os.path.exists(zipfile_path):
+                print(f"Skipping {year}/{month} as it is already compressed.")
+                log_progress(year, month)
                 continue
 
             month_start = datetime.datetime(year, month, 1)
@@ -430,80 +254,105 @@ def download_and_organize_emails(creds, cutoff_date_str, save_path="emails"):
             if next_month > cutoff_date:
                 next_month = cutoff_date + datetime.timedelta(days=1)
 
+            # Build date range query
             after_date_str = month_start.strftime('%Y/%m/%d')
             before_date_str = next_month.strftime('%Y/%m/%d')
 
-            # Check if there are any emails in the month
-            has_emails = check_emails_in_month(service, year, month, after_date_str, before_date_str)
-            if not has_emails:
-                print(f"No emails found for {year}/{month}. Marking month as processed.")
-                log_month_progress(year, month)
-                continue  # Skip to the next month
+            # Exclude spam and trash
+            query = f"after:{after_date_str} before:{before_date_str} -in:spam -in:trash"
+
+            print(f"Processing emails for {year}/{month:02d}")
 
             folder_path = os.path.join(save_path, str(year), f"{month:02d}")
-            os.makedirs(folder_path, exist_ok=True)
+            # delete the folder if it exists
+            if os.path.exists(folder_path):
+                shutil.rmtree(folder_path)
 
-            # Split the month into day chunks
-            day_chunks = []
-            chunk_start = month_start
-            while chunk_start < next_month:
-                chunk_end = min(chunk_start + datetime.timedelta(days=DAY_CHUNK_SIZE), next_month)
-                day_chunks.append((chunk_start, chunk_end))
-                chunk_start = chunk_end
+            page_token = None
+            all_message_ids = []
 
-            print(f"Processing {len(day_chunks)} chunks for {year}/{month:02d}.")
+            while True:
+                try:
+                    # Fetch emails with pagination
+                    results = service.users().messages().list(
+                        userId="me",
+                        q=query,
+                        pageToken=page_token,
+                        maxResults=5000  # Increase batch size
+                    ).execute()
+                    messages = results.get("messages", [])
 
-            chunk_futures = []
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                for chunk_start, chunk_end in day_chunks:
-                    chunk_start_day = chunk_start.day
-                    chunk_end_day = (chunk_end - datetime.timedelta(days=1)).day
+                    if not messages:
+                        if not page_token:
+                            print(f"No messages found for {year}/{month:02d}.")
+                        break
 
-                    processed_chunk = f"{year}/{month}/{chunk_start_day}-{chunk_end_day}"
-                    if processed_chunk in processed_chunks:
-                        print(f"Skipping chunk: {processed_chunk} as it's already processed.")
+                    # Collect message IDs
+                    all_message_ids.extend([msg["id"] for msg in messages])
+
+                    page_token = results.get("nextPageToken")
+                    if not page_token:
+                        break  # Exit the loop if there are no more pages
+
+                except HttpError as error:
+                    print(f"An error occurred: {error}")
+                    if error.resp.status == 429:
+                        print("Rate limit reached, waiting before retrying...")
+                        time.sleep(10)
                         continue
 
-                    after_date_str = chunk_start.strftime('%Y/%m/%d')
-                    before_date_str = chunk_end.strftime('%Y/%m/%d')
-                    query = f"after:{after_date_str} before:{before_date_str} -in:spam -in:trash"
+            if all_message_ids:
+                # Create folder for the month
+                os.makedirs(folder_path, exist_ok=True)
+                email_downloaded = True
 
-                    print(f"Submitting chunk: {after_date_str} to {before_date_str}")
+                # Multithreaded fetching and processing
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = [executor.submit(process_email, creds, msg_id) for msg_id in all_message_ids]
+                    email_buffer = []
+                    buffer_limit = 10000  # Adjust as needed
 
-                    chunk_future = executor.submit(
-                        fetch_and_process_chunk, creds, query, folder_path, processed_chunk
-                    )
-                    chunk_futures.append(chunk_future)
+                    for future in as_completed(futures):
+                        email_data = future.result()
+                        if email_data:
+                            email_buffer.append(email_data)
+                            print(f"Processed email: {email_data['folder_name']}")
+                        else:
+                            print("Failed to process an email.")
 
-                for future in as_completed(chunk_futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"Error in chunk processing: {e}")
+                        if len(email_buffer) >= buffer_limit:
+                            write_buffer_to_disk(email_buffer, folder_path)
+                            email_buffer.clear()
 
-            # Compress the month's folder and remove uncompressed data
-            compress_month_folder(save_path, year, month)
-            # Log the month as processed
-            log_month_progress(year, month)
-            increase_parallelization()
+                    # Write any remaining emails in the buffer
+                    if email_buffer:
+                        write_buffer_to_disk(email_buffer, folder_path)
+                        email_buffer.clear()
+
+                # Compress the month's folder and remove uncompressed data
+                compress_month_folder(save_path, year, month)
+                # Log progress for the month
+                log_progress(year, month)
+            else:
+                # If no emails were downloaded, ensure no empty directories are left
+                if os.path.exists(folder_path):
+                    os.rmdir(folder_path)
+                print(f"No emails downloaded for {year}/{month:02d}, skipping compression and logging.")
 
     except HttpError as error:
         print(f"An error occurred: {error}")
 
+
 def compress_month_folder(save_path, year, month):
-    """
-    Compresses the month's folder to save space.
-    """
-    folder_path = os.path.join(save_path, str(year), f"{month:02d}")
+    """Compresses the month's folder to save space."""
+    folder_path = os.path.join(SAVE_PATH, str(year), f"{month:02d}")
     if os.path.exists(folder_path):
         shutil.make_archive(folder_path, 'zip', folder_path)
         shutil.rmtree(folder_path)
         print(f"Compressed and removed folder: {folder_path}")
 
 def delete_emails_before_date(creds, cutoff_date_str):
-    """
-    Deletes emails before the specified cutoff date.
-    """
+    """Deletes emails before the specified cutoff date."""
     service = build_service(creds)
     try:
         query = f"before:{cutoff_date_str} -in:spam -in:trash"
@@ -514,7 +363,7 @@ def delete_emails_before_date(creds, cutoff_date_str):
                 userId="me",
                 q=query,
                 pageToken=page_token,
-                maxResults=500
+                maxResults=5000  # Increase batch size
             ).execute()
             messages = results.get("messages", [])
 
@@ -530,7 +379,7 @@ def delete_emails_before_date(creds, cutoff_date_str):
                 service.users().messages().batchDelete(userId="me", body=batch_request).execute()
                 print(f"Deleted {len(message_ids)} emails.")
             except HttpError as error:
-                print(f"Error deleting emails: {error}")
+                print(f"An error occurred while deleting emails: {error}")
                 if error.resp.status == 429:
                     print("Rate limit reached, waiting before retrying...")
                     time.sleep(10)
@@ -544,15 +393,15 @@ def delete_emails_before_date(creds, cutoff_date_str):
         print(f"An error occurred: {error}")
 
 def main():
-    """
-    Main function to execute the script.
-    """
     # Accept cutoff date from user in mm-dd-yyyy format
     cutoff_date_str = input("Enter the cutoff date (mm-dd-yyyy): ")
     creds = authenticate_gmail()
 
+    # Load processed months from log file
+    processed_months = load_processed_months()
+
     # Download and organize emails
-    download_and_organize_emails(creds, cutoff_date_str, save_path=SAVE_PATH)
+    download_and_organize_emails(creds, cutoff_date_str, save_path=SAVE_PATH, processed_months=processed_months)
 
     # Delete emails before the cutoff date
     delete_emails_before_date(creds, cutoff_date_str)
